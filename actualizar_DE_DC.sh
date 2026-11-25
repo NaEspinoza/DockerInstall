@@ -1,98 +1,382 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -Eeuo pipefail
 
-echo "==============================================" echo " MIGRACIÓN Y ACTUALIZACIÓN DE DOCKER" echo "=============================================="
+# ==============================================================================
+# MIGRACIÓN Y ACTUALIZACIÓN DE DOCKER ENGINE + DOCKER COMPOSE V2
+# Sistema soportado: Ubuntu (y derivados basados en Ubuntu con UBUNTU_CODENAME)
+# Documentación: https://docs.docker.com/engine/install/ubuntu/
+# ==============================================================================
 
-1. Verificar Ubuntu
+readonly DOCKER_GPG_URL="https://download.docker.com/linux/ubuntu/gpg"
+readonly DOCKER_REPO_URL="https://download.docker.com/linux/ubuntu"
+readonly DOCKER_KEYRING="/etc/apt/keyrings/docker.asc"
+readonly DOCKER_SOURCES="/etc/apt/sources.list.d/docker.sources"
+readonly LEGACY_DOCKER_LIST="/etc/apt/sources.list.d/docker.list"
 
-if [ ! -f /etc/os-release ]; then echo "ERROR: No se pudo identificar el sistema operativo." exit 1 fi
+readonly -a DOCKER_PACKAGES=(
+    docker-ce
+    docker-ce-cli
+    containerd.io
+    docker-buildx-plugin
+    docker-compose-plugin
+)
 
-source /etc/os-release
+TMP_KEY_FILE=""
 
-if [ "$ID" != "ubuntu" ]; then echo "ERROR: Este script requiere Ubuntu." exit 1 fi
+# --- Colores y utilidades de salida -------------------------------------------
+if [ -t 1 ]; then
+    readonly C_RESET='\033[0m'
+    readonly C_INFO='\033[0;34m'
+    readonly C_OK='\033[0;32m'
+    readonly C_WARN='\033[0;33m'
+    readonly C_ERR='\033[0;31m'
+else
+    readonly C_RESET=''
+    readonly C_INFO=''
+    readonly C_OK=''
+    readonly C_WARN=''
+    readonly C_ERR=''
+fi
 
-UBUNTU_CODENAME="{UBUNTU_CODENAME:-VERSION_CODENAME}" ARCH="$(dpkg --print-architecture)"
+log_info()  { printf "${C_INFO}[INFO]${C_RESET} %s\n" "$*"; }
+log_ok()    { printf "${C_OK}[OK]${C_RESET} %s\n" "$*"; }
+log_warn()  { printf "${C_WARN}[AVISO]${C_RESET} %s\n" "$*" >&2; }
+log_error() { printf "${C_ERR}[ERROR]${C_RESET} %s\n" "$*" >&2; }
 
-echo "Sistema: $PRETTY_NAME" echo "Codename: $UBUNTU_CODENAME" echo "Arquitectura: $ARCH"
+die() {
+    log_error "$*"
+    exit 1
+}
 
-2. Comprobar instalación previa
+cleanup() {
+    if [ -n "${TMP_KEY_FILE:-}" ] && [ -f "$TMP_KEY_FILE" ]; then
+        rm -f "$TMP_KEY_FILE"
+    fi
+}
 
-echo "" echo "[1/7] Comprobando instalación existente..."
+on_error() {
+    local exit_code=$?
+    local line_no=$1
+    log_error "Fallo inesperado en la línea ${line_no} (código de salida: ${exit_code})."
+    exit "$exit_code"
+}
 
-if ! command -v docker >/dev/null 2>&1; then echo "ERROR: Docker no está instalado." echo "Utiliza el script de instalación inicial." exit 1 fi
+trap cleanup EXIT
+trap 'on_error $LINENO' ERR
 
-docker --version || true docker compose version || true
+usage() {
+    cat <<EOF
+Uso: $(basename "$0") [OPCIONES]
 
-3. Comprobar y configurar clave GPG
+Migra el repositorio legado (.list) al formato Deb822 (.sources) si existe,
+actualiza la clave GPG oficial y actualiza Docker Engine, Buildx y Compose V2
+sin eliminar imágenes, contenedores ni volúmenes existentes.
 
-echo "" echo "[2/7] Configurando clave GPG oficial..."
+Opciones:
+  -h, --help     Muestra esta ayuda y finaliza.
+EOF
+}
 
-sudo install -m 0755 -d /etc/apt/keyrings
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                die "Opción desconocida: '$1'. Usa --help para ver las opciones disponibles."
+                ;;
+        esac
+        shift
+    done
+}
 
-sudo curl -fsSL
-https://download.docker.com/linux/ubuntu/gpg
--o /etc/apt/keyrings/docker.asc
+# Ejecuta comandos como root (directamente o vía sudo)
+run_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
 
-sudo chmod a+r /etc/apt/keyrings/docker.asc
+run_apt() {
+    run_root env DEBIAN_FRONTEND=noninteractive \
+        apt-get -o DPkg::Lock::Timeout=60 "$@"
+}
 
-4. Migrar repositorio antiguo al formato Deb822
+is_pkg_installed() {
+    local pkg="$1"
+    dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | grep -qx "install ok installed"
+}
 
-echo "" echo "[3/7] Actualizando configuración del repositorio..."
+check_privileges() {
+    if [ "$(id -u)" -eq 0 ]; then
+        return 0
+    fi
 
-sudo tee /etc/apt/sources.list.d/docker.sources > /dev/null <<EOF Types: deb URIs: https://download.docker.com/linux/ubuntu Suites: ${UBUNTU_CODENAME} Components: stable Architectures: ${ARCH} Signed-By: /etc/apt/keyrings/docker.asc EOF
+    if ! command -v sudo >/dev/null 2>&1; then
+        die "Se requieren permisos de superusuario, pero 'sudo' no está instalado. Ejecuta como root."
+    fi
 
-Eliminar únicamente el archivo antiguo de configuración.
-No elimina paquetes ni datos de Docker.
+    log_info "Validando permisos de sudo..."
+    if ! sudo -v; then
+        die "No se pudieron obtener permisos de sudo."
+    fi
+}
 
-if [ -f /etc/apt/sources.list.d/docker.list ]; then sudo rm /etc/apt/sources.list.d/docker.list echo "Repositorio docker.list migrado correctamente." fi
+check_system() {
+    if [ "$(uname -s)" != "Linux" ]; then
+        die "Este script solo es compatible con Linux."
+    fi
 
-5. Actualizar índices APT
+    if ! command -v dpkg >/dev/null 2>&1 || ! command -v apt-get >/dev/null 2>&1; then
+        die "No se encontraron 'dpkg' o 'apt-get'. Este script requiere un sistema basado en APT/Ubuntu."
+    fi
 
-echo "" echo "[4/7] Actualizando índices de paquetes..."
+    if [ ! -f /etc/os-release ]; then
+        die "No se pudo identificar el sistema operativo (/etc/os-release no existe)."
+    fi
 
-sudo apt-get update
+    # shellcheck disable=SC1091
+    source /etc/os-release
 
-6. Actualizar Docker Engine y sus componentes
+    local os_id="${ID:-}"
+    local os_like="${ID_LIKE:-}"
+    local pretty_name="${PRETTY_NAME:-Ubuntu}"
 
-echo "" echo "[5/7] Actualizando Docker Engine y Compose..."
+    if [ "$os_id" != "ubuntu" ]; then
+        if [[ " $os_like " == *" ubuntu "* ]] && [ -n "${UBUNTU_CODENAME:-}" ]; then
+            log_warn "Derivado de Ubuntu detectado ($pretty_name). Se usará codename '$UBUNTU_CODENAME'."
+        else
+            die "Sistema no soportado ($pretty_name). Este script requiere Ubuntu."
+        fi
+    fi
 
-sudo apt-get install --only-upgrade -y
-docker-ce
-docker-ce-cli
-containerd.io
-docker-buildx-plugin
-docker-compose-plugin
+    UBUNTU_CODENAME="${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
+    if [ -z "$UBUNTU_CODENAME" ] && command -v lsb_release >/dev/null 2>&1; then
+        UBUNTU_CODENAME="$(lsb_release -cs 2>/dev/null || true)"
+    fi
 
-7. Habilitar e iniciar Docker
+    if [ -z "$UBUNTU_CODENAME" ]; then
+        die "No se pudo determinar el codename de Ubuntu (UBUNTU_CODENAME / VERSION_CODENAME)."
+    fi
 
-echo "" echo "[6/7] Verificando servicio Docker..."
+    ARCH="$(dpkg --print-architecture)"
+    case "$ARCH" in
+        amd64|arm64|armhf|ppc64el|s390x)
+            ;;
+        i386)
+            die "La arquitectura 'i386' no está soportada por Docker Engine oficial."
+            ;;
+        *)
+            log_warn "Arquitectura '$ARCH' no listada entre las estándar de Docker; se continuará de todos modos."
+            ;;
+    esac
 
-sudo systemctl enable --now docker
+    log_info "Sistema:      $pretty_name"
+    log_info "Codename:     $UBUNTU_CODENAME"
+    log_info "Arquitectura: $ARCH"
+}
 
-sudo systemctl is-active --quiet docker
+check_existing_docker() {
+    log_info "[1/7] Comprobando instalación existente de Docker..."
 
-8. Mostrar versiones y estado
+    if ! is_pkg_installed "docker-ce"; then
+        if command -v snap >/dev/null 2>&1 && snap list docker >/dev/null 2>&1; then
+            die "Se detectó Docker instalado vía Snap. Este script actualiza paquetes oficiales 'docker-ce'. Usa 'instalar_DE_DC.sh' tras eliminar el snap."
+        fi
+        if is_pkg_installed "docker.io"; then
+            die "Se detectó el paquete no oficial 'docker.io' en lugar de 'docker-ce'. Usa 'instalar_DE_DC.sh' para migrar de forma segura al repositorio oficial."
+        fi
+        if ! command -v docker >/dev/null 2>&1; then
+            die "Docker no está instalado. Utiliza 'instalar_DE_DC.sh' para realizar la instalación inicial."
+        fi
+        die "Docker está presente pero no mediante el paquete oficial 'docker-ce'. Usa 'instalar_DE_DC.sh' para instalar la versión oficial."
+    fi
 
-echo "" echo "[7/7] Verificando componentes instalados..."
+    docker --version || true
+    docker compose version 2>/dev/null || log_warn "Docker Compose V2 aún no está instalado; se instalará durante la actualización."
 
-echo "" echo "==============================================" echo " VERSIONES INSTALADAS" echo "=============================================="
+    if command -v docker-compose >/dev/null 2>&1; then
+        log_warn "Se detectó 'docker-compose' (V1 legado). Se recomienda migrar a 'docker compose' (V2)."
+    fi
 
-docker --version docker compose version docker buildx version
+    # Verificar si hay paquetes de Docker retenidos (held) en APT
+    local -a held_packages=()
+    local pkg
+    for pkg in "${DOCKER_PACKAGES[@]}"; do
+        if apt-mark showhold "$pkg" 2>/dev/null | grep -qx "$pkg"; then
+            held_packages+=("$pkg")
+        fi
+    done
 
-echo "" echo "==============================================" echo " ESTADO DEL SERVICIO" echo "=============================================="
+    if [ "${#held_packages[@]}" -gt 0 ]; then
+        die "Los siguientes paquetes están marcados como retenidos (hold) en APT: ${held_packages[*]}. Libéralos con 'sudo apt-mark unhold ${held_packages[*]}' antes de actualizar."
+    fi
+}
 
-sudo systemctl status docker --no-pager
+ensure_dependencies() {
+    local -a missing=()
+    local pkg
+    for pkg in ca-certificates curl; do
+        if ! is_pkg_installed "$pkg"; then
+            missing+=("$pkg")
+        fi
+    done
 
-echo "" echo "==============================================" echo " PAQUETES INSTALADOS" echo "=============================================="
+    if [ "${#missing[@]}" -gt 0 ]; then
+        log_info "Instalando dependencias faltantes: ${missing[*]}"
+        run_apt update
+        run_apt install -y "${missing[@]}"
+    fi
+}
 
-dpkg-query -W
-docker-ce
-docker-ce-cli
-containerd.io
-docker-buildx-plugin
-docker-compose-plugin
+setup_gpg_key() {
+    log_info "[2/7] Actualizando clave GPG oficial de Docker..."
 
-echo "" echo "==============================================" echo " MIGRACIÓN COMPLETADA" echo "=============================================="
+    ensure_dependencies
+    run_root install -m 0755 -d /etc/apt/keyrings
 
-echo "Docker Engine y Docker Compose V2 actualizados." echo "Los datos existentes de Docker no fueron eliminados." echo "=============================================="
+    TMP_KEY_FILE="$(mktemp)"
+    if ! curl -fsSL --connect-timeout 15 --retry 3 --retry-delay 2 \
+        "$DOCKER_GPG_URL" -o "$TMP_KEY_FILE"; then
+        die "No se pudo descargar la clave GPG oficial desde $DOCKER_GPG_URL."
+    fi
+
+    if [ ! -s "$TMP_KEY_FILE" ] || ! grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$TMP_KEY_FILE"; then
+        die "El archivo descargado no parece una clave GPG válida."
+    fi
+
+    run_root install -m 0644 "$TMP_KEY_FILE" "$DOCKER_KEYRING"
+    rm -f "$TMP_KEY_FILE"
+    TMP_KEY_FILE=""
+    log_ok "Clave GPG actualizada en $DOCKER_KEYRING."
+}
+
+warn_duplicate_docker_sources() {
+    local -a matches=()
+    local file
+    while IFS= read -r file; do
+        if [ "$file" != "$DOCKER_SOURCES" ] && [ "$file" != "$LEGACY_DOCKER_LIST" ]; then
+            matches+=("$file")
+        fi
+    done < <(grep -rEl '^[[:space:]]*[^#].*download\.docker\.com' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true)
+
+    if [ "${#matches[@]}" -gt 0 ]; then
+        log_warn "Se detectaron otras fuentes APT con 'download.docker.com': ${matches[*]}"
+        log_warn "Si 'apt-get update' falla por conflicto de 'Signed-By', revisa o elimina esos archivos."
+    fi
+}
+
+migrate_repository() {
+    log_info "[3/7] Configurando repositorio oficial (formato Deb822)..."
+
+    run_root tee "$DOCKER_SOURCES" >/dev/null <<EOF
+Types: deb
+URIs: ${DOCKER_REPO_URL}
+Suites: ${UBUNTU_CODENAME}
+Components: stable
+Architectures: ${ARCH}
+Signed-By: ${DOCKER_KEYRING}
+EOF
+    run_root chmod 0644 "$DOCKER_SOURCES"
+
+    # Eliminar únicamente la configuración legada .list (no afecta paquetes ni /var/lib/docker)
+    if [ -f "$LEGACY_DOCKER_LIST" ]; then
+        run_root rm -f "$LEGACY_DOCKER_LIST"
+        log_ok "Repositorio legado $LEGACY_DOCKER_LIST migrado a $DOCKER_SOURCES."
+    else
+        log_ok "Repositorio configurado en $DOCKER_SOURCES."
+    fi
+
+    warn_duplicate_docker_sources
+}
+
+update_apt_indices() {
+    log_info "[4/7] Actualizando índices de paquetes APT..."
+    if ! run_apt update; then
+        die "Falló 'apt-get update'. Verifica tu conexión o que el codename '$UBUNTU_CODENAME' esté disponible en el repositorio de Docker."
+    fi
+}
+
+upgrade_docker() {
+    log_info "[5/7] Actualizando Docker Engine, Buildx y Compose V2..."
+    # Se usa 'install -y' (en lugar de --only-upgrade) para actualizar los existentes
+    # e instalar plugins faltantes como docker-buildx-plugin o docker-compose-plugin.
+    run_apt install -y "${DOCKER_PACKAGES[@]}"
+    log_ok "Componentes de Docker actualizados."
+}
+
+verify_service() {
+    log_info "[6/7] Verificando servicio Docker..."
+
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        run_root systemctl enable --now docker
+        if ! run_root systemctl is-active --quiet docker; then
+            die "El servicio 'docker' no quedó activo tras la actualización."
+        fi
+        log_ok "Servicio systemd 'docker' habilitado y activo."
+    elif [ -x /etc/init.d/docker ] && command -v service >/dev/null 2>&1; then
+        run_root service docker restart || run_root service docker start
+        log_ok "Servicio 'docker' verificado vía SysVinit."
+    else
+        log_warn "No se detectó systemd activo; omitiendo verificación de servicio."
+    fi
+}
+
+show_summary() {
+    log_info "[7/7] Verificando componentes instalados..."
+
+    echo ""
+    echo "=============================================="
+    echo " VERSIONES INSTALADAS"
+    echo "=============================================="
+    docker --version
+    docker compose version
+    docker buildx version
+
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        echo ""
+        echo "=============================================="
+        echo " ESTADO DEL SERVICIO"
+        echo "=============================================="
+        run_root systemctl status docker --no-pager -l | sed -n '1,12p'
+    fi
+
+    echo ""
+    echo "=============================================="
+    echo " PAQUETES INSTALADOS"
+    echo "=============================================="
+    dpkg-query -W -f='${Package}\t${Version}\n' "${DOCKER_PACKAGES[@]}"
+
+    echo ""
+    echo "=============================================="
+    echo " MIGRACIÓN Y ACTUALIZACIÓN COMPLETADAS"
+    echo "=============================================="
+    echo "Docker Engine y Docker Compose V2 actualizados."
+    echo "Los datos existentes de Docker (/var/lib/docker) no fueron eliminados."
+    echo "=============================================="
+}
+
+main() {
+    parse_args "$@"
+
+    echo "=============================================="
+    echo " MIGRACIÓN Y ACTUALIZACIÓN DE DOCKER"
+    echo "=============================================="
+
+    check_system
+    check_privileges
+    check_existing_docker
+    setup_gpg_key
+    migrate_repository
+    update_apt_indices
+    upgrade_docker
+    verify_service
+    show_summary
+}
+
+main "$@"
